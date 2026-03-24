@@ -296,7 +296,7 @@ impl SavingsGoalContract {
 
     pub fn pause(env: Env, caller: Address) {
         caller.require_auth();
-        let admin = Self::get_pause_admin(&env).ok_or(SavingsGoalsError::Unauthorized).unwrap();
+        let admin = Self::get_pause_admin(&env).unwrap_or_else(|| panic!("No pause admin set"));
         if admin != caller {
             panic!("Unauthorized");
         }
@@ -309,7 +309,7 @@ impl SavingsGoalContract {
 
     pub fn unpause(env: Env, caller: Address) {
         caller.require_auth();
-        let admin = Self::get_pause_admin(&env).ok_or(SavingsGoalsError::Unauthorized).unwrap();
+        let admin = Self::get_pause_admin(&env).unwrap_or_else(|| panic!("No pause admin set"));
         if admin != caller {
             panic!("Unauthorized");
         }
@@ -329,7 +329,7 @@ impl SavingsGoalContract {
 
     pub fn pause_function(env: Env, caller: Address, func: Symbol) {
         caller.require_auth();
-        let admin = Self::get_pause_admin(&env).ok_or(SavingsGoalsError::Unauthorized).unwrap();
+        let admin = Self::get_pause_admin(&env).unwrap_or_else(|| panic!("No pause admin set"));
         if admin != caller {
             panic!("Unauthorized");
         }
@@ -346,7 +346,7 @@ impl SavingsGoalContract {
 
     pub fn unpause_function(env: Env, caller: Address, func: Symbol) {
         caller.require_auth();
-        let admin = Self::get_pause_admin(&env).ok_or(SavingsGoalsError::Unauthorized).unwrap();
+        let admin = Self::get_pause_admin(&env).unwrap_or_else(|| panic!("No pause admin set"));
         if admin != caller {
             panic!("Unauthorized");
         }
@@ -1447,6 +1447,34 @@ impl SavingsGoalContract {
         true
     }
 
+    /// Executes all savings schedules whose `next_due` timestamp is at or before
+    /// the current ledger timestamp.
+    ///
+    /// # Idempotency guarantee
+    /// A schedule is skipped if its `last_executed` timestamp is greater than or
+    /// equal to its `next_due` timestamp at the time of the call.  This prevents
+    /// double-crediting a goal when `execute_due_savings_schedules` is invoked
+    /// multiple times within the same execution window – for example, two
+    /// transactions landing in the same Stellar ledger (which share a ledger
+    /// timestamp), or a retry after a transient failure.
+    ///
+    /// # Next-due advancement
+    /// * **Recurring schedules** (`interval > 0`): `next_due` is advanced by
+    ///   `interval` until it is strictly greater than `current_time`.  Any
+    ///   skipped intervals increment `missed_count`.
+    /// * **One-shot schedules** (`interval == 0`): the schedule is deactivated
+    ///   (`active = false`) after a single execution.
+    ///
+    /// # Returns
+    /// A vector of schedule IDs that were executed in this call.
+    ///
+    /// # Security assumptions
+    /// * `last_executed` is written by this function only **after** a
+    ///   successful credit to the goal.  It is never reset by other functions,
+    ///   so an attacker cannot clear it to trigger re-execution.
+    /// * `modify_savings_schedule` resets `next_due` to a future timestamp
+    ///   supplied by the owner.  A new `next_due > last_executed` correctly
+    ///   re-enables execution for the updated due date.
     pub fn execute_due_savings_schedules(env: Env) -> Vec<u32> {
         Self::extend_instance_ttl(&env);
 
@@ -1468,6 +1496,16 @@ impl SavingsGoalContract {
         for (schedule_id, mut schedule) in schedules.iter() {
             if !schedule.active || schedule.next_due > current_time {
                 continue;
+            }
+
+            // Idempotency guard: skip if this schedule was already executed at
+            // or after its current `next_due`.  Prevents double-crediting when
+            // this function is called more than once within the same execution
+            // window (same ledger timestamp) or retried after a partial run.
+            if let Some(last_exec) = schedule.last_executed {
+                if last_exec >= schedule.next_due {
+                    continue;
+                }
             }
 
             if let Some(mut goal) = goals.get(schedule.goal_id) {
