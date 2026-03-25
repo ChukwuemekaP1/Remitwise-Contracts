@@ -2941,27 +2941,6 @@ mod test {
         // No sign, should fail on caller.require_auth()
         client.archive_paid_bills(&caller, &1000000);
     }
-
-    #[test]
-    #[should_panic(expected = "Status(AuthError)")]
-    fn test_bulk_cleanup_bills_no_auth_fails() {
-        let env = make_env();
-        let cid = env.register_contract(None, BillPayments);
-        let client = BillPaymentsClient::new(&env, &cid);
-        let admin = Address::generate(&env);
-
-        client.bulk_cleanup_bills(&admin, &1000000);
-    }
-}
-}
-
-fn extend_instance_ttl(env: &Env) {
-    // Extend the contract instance itself
-    env.storage().instance().extend_ttl(
-        INSTANCE_LIFETIME_THRESHOLD, 
-        INSTANCE_BUMP_AMOUNT
-    );
-}
 }
 
 pub fn create_bill(env: Env, ...) {

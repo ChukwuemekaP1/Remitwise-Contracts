@@ -68,7 +68,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
-    Env, Symbol, Vec,
+    Env, Symbol, Vec, Map, IntoVal,
 };
 
 #[cfg(test)]
@@ -208,6 +208,10 @@ pub enum OrchestratorError {
     /// execution is already in progress. This prevents nested execution attacks
     /// and partial-state corruption.
     ReentrancyDetected = 10,
+    /// Address references the orchestrator itself
+    SelfReferential = 11,
+    /// Duplicate addresses provided for distinct roles
+    DuplicateAddress = 12,
 }
 
 /// Execution state tracking for reentrancy protection.
@@ -224,7 +228,7 @@ pub enum OrchestratorError {
 /// At most one execution can be active at any time. Any attempt to enter
 /// `Executing` state while already executing returns `ReentrancyDetected`.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ExecutionState {
     /// No execution in progress; entry points may be called
@@ -255,6 +259,30 @@ pub struct RemittanceFlowResult {
     pub insurance_success: bool,
     /// Timestamp of execution
     pub timestamp: u64,
+}
+
+/// Arguments for a single remittance flow in a batch
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemittanceFlowArgs {
+    /// Total remittance amount to split
+    pub total_amount: i128,
+    /// Address of site-specific Family Wallet contract
+    pub family_wallet_addr: Address,
+    /// Address of site-specific Remittance Split contract
+    pub remittance_split_addr: Address,
+    /// Address of site-specific Savings Goals contract
+    pub savings_addr: Address,
+    /// Address of site-specific Bill Payments contract
+    pub bills_addr: Address,
+    /// Address of site-specific Insurance contract
+    pub insurance_addr: Address,
+    /// Target savings goal ID
+    pub goal_id: u32,
+    /// Target bill ID
+    pub bill_id: u32,
+    /// Target insurance policy ID
+    pub policy_id: u32,
 }
 
 /// Event emitted on successful remittance flow completion
@@ -420,6 +448,46 @@ impl Orchestrator {
     /// 2. Call check_spending_limit via cross-contract call
     /// 3. If the call succeeds and returns true, permission is granted
     /// 4. If the call fails or returns false, permission is denied
+    /// Validate that all provided contract addresses are distinct and
+    /// do not reference the orchestrator itself.
+    fn validate_remittance_flow_addresses(
+        env: &Env,
+        family_wallet_addr: &Address,
+        remittance_split_addr: &Address,
+        savings_addr: &Address,
+        bills_addr: &Address,
+        insurance_addr: &Address,
+    ) -> Result<(), OrchestratorError> {
+        let current_contract = env.current_contract_address();
+
+        // Self-referential check
+        if family_wallet_addr == &current_contract
+            || remittance_split_addr == &current_contract
+            || savings_addr == &current_contract
+            || bills_addr == &current_contract
+            || insurance_addr == &current_contract
+        {
+            return Err(OrchestratorError::SelfReferential);
+        }
+
+        // Distinctness check
+        if family_wallet_addr == remittance_split_addr
+            || family_wallet_addr == savings_addr
+            || family_wallet_addr == bills_addr
+            || family_wallet_addr == insurance_addr
+            || remittance_split_addr == savings_addr
+            || remittance_split_addr == bills_addr
+            || remittance_split_addr == insurance_addr
+            || savings_addr == bills_addr
+            || savings_addr == insurance_addr
+            || bills_addr == insurance_addr
+        {
+            return Err(OrchestratorError::DuplicateAddress);
+        }
+
+        Ok(())
+    }
+
     fn check_family_wallet_permission(
         env: &Env,
         family_wallet_addr: &Address,
@@ -1118,121 +1186,238 @@ impl Orchestrator {
             return Err(OrchestratorError::InvalidAmount);
         }
 
-        // Execute the flow body in a closure to ensure lock release on all paths
-        let result = (|| {
-            // Step 2: Check family wallet permission
-            Self::check_family_wallet_permission(&env, &family_wallet_addr, &caller, total_amount)
-                .map_err(|e| {
-                    Self::emit_error_event(
-                        &env,
-                        &caller,
-                        symbol_short!("perm_chk"),
-                        e as u32,
-                        timestamp,
-                    );
-                    e
-                })?;
-
-            // Step 3: Check spending limit
-            Self::check_spending_limit(&env, &family_wallet_addr, &caller, total_amount).map_err(
-                |e| {
-                    Self::emit_error_event(
-                        &env,
-                        &caller,
-                        symbol_short!("spend_lm"),
-                        e as u32,
-                        timestamp,
-                    );
-                    e
-                },
-            )?;
-
-            // Step 4: Extract allocations from remittance split
-            let allocations = Self::extract_allocations(&env, &remittance_split_addr, total_amount)
-                .map_err(|e| {
-                    Self::emit_error_event(
-                        &env,
-                        &caller,
-                        symbol_short!("split"),
-                        e as u32,
-                        timestamp,
-                    );
-                    e
-                })?;
-
-            // Extract individual amounts
-            let spending_amount = allocations.get(0).unwrap_or(0);
-            let savings_amount = allocations.get(1).unwrap_or(0);
-            let bills_amount = allocations.get(2).unwrap_or(0);
-            let insurance_amount = allocations.get(3).unwrap_or(0);
-
-            // Step 5: Deposit to savings goal
-            let savings_success =
-                Self::deposit_to_savings(&env, &savings_addr, &caller, goal_id, savings_amount)
-                    .map_err(|e| {
-                        Self::emit_error_event(
-                            &env,
-                            &caller,
-                            symbol_short!("savings"),
-                            e as u32,
-                            timestamp,
-                        );
-                        e
-                    })
-                    .is_ok();
-
-            // Step 6: Pay bill
-            let bills_success =
-                Self::execute_bill_payment_internal(&env, &bills_addr, &caller, bill_id)
-                    .map_err(|e| {
-                        Self::emit_error_event(
-                            &env,
-                            &caller,
-                            symbol_short!("bills"),
-                            e as u32,
-                            timestamp,
-                        );
-                        e
-                    })
-                    .is_ok();
-
-            // Step 7: Pay insurance premium
-            let insurance_success =
-                Self::pay_insurance_premium(&env, &insurance_addr, &caller, policy_id)
-                    .map_err(|e| {
-                        Self::emit_error_event(
-                            &env,
-                            &caller,
-                            symbol_short!("insuranc"),
-                            e as u32,
-                            timestamp,
-                        );
-                        e
-                    })
-                    .is_ok();
-
-            // Build result
-            let flow_result = RemittanceFlowResult {
-                total_amount,
-                spending_amount,
-                savings_amount,
-                bills_amount,
-                insurance_amount,
-                savings_success,
-                bills_success,
-                insurance_success,
-                timestamp,
-            };
-
-            // Emit success event
-            Self::emit_success_event(&env, &caller, total_amount, &allocations, timestamp);
-
-            Ok(flow_result)
-        })();
+        // Execute core flow logic
+        let result = Self::execute_remittance_flow_logic(
+            &env,
+            &caller,
+            total_amount,
+            &family_wallet_addr,
+            &remittance_split_addr,
+            &savings_addr,
+            &bills_addr,
+            &insurance_addr,
+            goal_id,
+            bill_id,
+            policy_id,
+            timestamp,
+        );
 
         // Reentrancy guard: always release lock before returning
         Self::release_execution_lock(&env);
         result
+    }
+
+    /// Execute a batch of remittance flows in a single transaction
+    ///
+    /// This method allows processing multiple flows for high-volume stress testing
+    /// and mixed success/failure scenarios. Individual flows may fail without
+    /// reverting the entire batch if caught by the orchestrator.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `caller` - Address initiating the batch (must authorize)
+    /// * `flows` - List of remittance flow arguments
+    ///
+    /// # Returns
+    /// Vec containing results for each flow in the batch
+    pub fn execute_remittance_batch(
+        env: Env,
+        caller: Address,
+        flows: Vec<RemittanceFlowArgs>,
+    ) -> Result<Vec<Result<RemittanceFlowResult, OrchestratorError>>, OrchestratorError> {
+        // Reentrancy guard: acquire execution lock
+        Self::acquire_execution_lock(&env)?;
+
+        // Require caller authorization
+        caller.require_auth();
+
+        let timestamp = env.ledger().timestamp();
+        let mut batch_results = Vec::new(&env);
+
+        for flow in flows.iter() {
+            // Validate addresses for this specific flow
+            let addr_val = Self::validate_remittance_flow_addresses(
+                &env,
+                &flow.family_wallet_addr,
+                &flow.remittance_split_addr,
+                &flow.savings_addr,
+                &flow.bills_addr,
+                &flow.insurance_addr,
+            );
+
+            if addr_val.is_err() {
+                let err = addr_val.unwrap_err();
+                Self::emit_error_event(
+                    &env,
+                    &caller,
+                    symbol_short!("addr_val"),
+                    err as u32,
+                    timestamp,
+                );
+                batch_results.push_back(Err(err));
+                continue;
+            }
+
+            if flow.total_amount <= 0 {
+                Self::emit_error_event(
+                    &env,
+                    &caller,
+                    symbol_short!("validate"),
+                    OrchestratorError::InvalidAmount as u32,
+                    timestamp,
+                );
+                batch_results.push_back(Err(OrchestratorError::InvalidAmount));
+                continue;
+            }
+
+            // Execute flow logic for this entry
+            let res = Self::execute_remittance_flow_logic(
+                &env,
+                &caller,
+                flow.total_amount,
+                &flow.family_wallet_addr,
+                &flow.remittance_split_addr,
+                &flow.savings_addr,
+                &flow.bills_addr,
+                &flow.insurance_addr,
+                flow.goal_id,
+                flow.bill_id,
+                flow.policy_id,
+                timestamp,
+            );
+
+            batch_results.push_back(res);
+        }
+
+        // Reentrancy guard: always release lock before returning
+        Self::release_execution_lock(&env);
+
+        Ok(batch_results)
+    }
+
+    /// Internal logic helper that implements the core remittance flow steps.
+    /// Does not manage the reentrancy lock or initial metadata validation.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_remittance_flow_logic(
+        env: &Env,
+        caller: &Address,
+        total_amount: i128,
+        family_wallet_addr: &Address,
+        remittance_split_addr: &Address,
+        savings_addr: &Address,
+        bills_addr: &Address,
+        insurance_addr: &Address,
+        goal_id: u32,
+        bill_id: u32,
+        policy_id: u32,
+        timestamp: u64,
+    ) -> Result<RemittanceFlowResult, OrchestratorError> {
+        // Step 1: Check family wallet permission
+        Self::check_family_wallet_permission(env, family_wallet_addr, caller, total_amount)
+            .map_err(|e| {
+                Self::emit_error_event(
+                    env,
+                    caller,
+                    symbol_short!("perm_chk"),
+                    e as u32,
+                    timestamp,
+                );
+                e
+            })?;
+
+        // Step 2: Check spending limit
+        Self::check_spending_limit(env, family_wallet_addr, caller, total_amount).map_err(|e| {
+            Self::emit_error_event(
+                env,
+                caller,
+                symbol_short!("spend_lm"),
+                e as u32,
+                timestamp,
+            );
+            e
+        })?;
+
+        // Step 3: Extract allocations from remittance split
+        let allocations = Self::extract_allocations(env, remittance_split_addr, total_amount)
+            .map_err(|e| {
+                Self::emit_error_event(
+                    env,
+                    caller,
+                    symbol_short!("split"),
+                    e as u32,
+                    timestamp,
+                );
+                e
+            })?;
+
+        // Extract individual amounts
+        let spending_amount = allocations.get(0).unwrap_or(0);
+        let savings_amount = allocations.get(1).unwrap_or(0);
+        let bills_amount = allocations.get(2).unwrap_or(0);
+        let insurance_amount = allocations.get(3).unwrap_or(0);
+
+        // Step 4: Deposit to savings goal
+        let savings_success =
+            Self::deposit_to_savings(env, savings_addr, caller, goal_id, savings_amount)
+                .map_err(|e| {
+                    Self::emit_error_event(
+                        env,
+                        caller,
+                        symbol_short!("savings"),
+                        e as u32,
+                        timestamp,
+                    );
+                    e
+                })
+                .is_ok();
+
+        // Step 5: Pay bill
+        let bills_success =
+            Self::execute_bill_payment_internal(env, bills_addr, caller, bill_id)
+                .map_err(|e| {
+                    Self::emit_error_event(
+                        env,
+                        caller,
+                        symbol_short!("bills"),
+                        e as u32,
+                        timestamp,
+                    );
+                    e
+                })
+                .is_ok();
+
+        // Step 6: Pay insurance premium
+        let insurance_success =
+            Self::pay_insurance_premium(env, insurance_addr, caller, policy_id)
+                .map_err(|e| {
+                    Self::emit_error_event(
+                        env,
+                        caller,
+                        symbol_short!("insuranc"),
+                        e as u32,
+                        timestamp,
+                    );
+                    e
+                })
+                .is_ok();
+
+        // Build result
+        let flow_result = RemittanceFlowResult {
+            total_amount,
+            spending_amount,
+            savings_amount,
+            bills_amount,
+            insurance_amount,
+            savings_success,
+            bills_success,
+            insurance_success,
+            timestamp,
+        };
+
+        // Emit success event
+        Self::emit_success_event(env, caller, total_amount, &allocations, timestamp);
+
+        Ok(flow_result)
     }
 
     // ============================================================================
