@@ -1,3 +1,4 @@
+#![no_std]
 use soroban_sdk::{symbol_short, vec, Address, BytesN, Env, Symbol};
 
 pub fn pay_premium(env: Env, _policy_id: BytesN<32>) {
