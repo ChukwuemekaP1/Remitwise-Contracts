@@ -976,6 +976,21 @@ impl RemittanceSplit {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
+    /// Creates a new remittance schedule with a unique, monotonic ID.
+    ///
+    /// # Arguments
+    /// * `owner` - The address of the schedule owner (must authorize)
+    /// * `amount` - The positive i128 amount to be distributed on each execution
+    /// * `next_due` - The Unix timestamp of the first/next execution (must be in the future)
+    /// * `interval` - The interval in seconds for recurring schedules (0 for one-time)
+    ///
+    /// # Returns
+    /// * `Ok(u32)` - The unique, monotonic ID assigned to the new schedule
+    /// * `Err(RemittanceSplitError)` - If authorization fails or parameters are invalid
+    ///
+    /// # Security Invariants
+    /// 1. ID Generation is monotonic and derived from an instance-synchronized counter (`NEXT_RSCH`).
+    /// 2. The ID is unique across the lifetime of the contract instance.
     pub fn create_remittance_schedule(
         env: Env,
         owner: Address,
@@ -1002,12 +1017,20 @@ impl RemittanceSplit {
             .get(&symbol_short!("REM_SCH"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let next_schedule_id = env
+        let current_max_id: u32 = env
             .storage()
             .instance()
             .get(&symbol_short!("NEXT_RSCH"))
-            .unwrap_or(0u32)
-            + 1;
+            .unwrap_or(0u32);
+            
+        let next_schedule_id = current_max_id
+            .checked_add(1)
+            .ok_or(RemittanceSplitError::Overflow)?;
+
+        // Explicit uniqueness check to prevent any potential storage collisions
+        if schedules.contains_key(next_schedule_id) {
+            return Err(RemittanceSplitError::Overflow); // Should be unreachable with monotonic counter
+        }
 
         let schedule = RemittanceSchedule {
             id: next_schedule_id,
