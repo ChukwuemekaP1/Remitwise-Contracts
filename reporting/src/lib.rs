@@ -43,6 +43,18 @@ pub struct TrendData {
     pub change_percentage: i32, // Can be negative
 }
 
+/// Indicates the completeness of the data retrieved from external contracts
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DataAvailability {
+    /// All external calls succeeded and data is complete
+    Complete = 0,
+    /// Some external calls failed or returned partial data
+    Partial = 1,
+    /// Critical external calls failed or addresses not configured, data is missing/default
+    Missing = 2,
+}
+
 /// Remittance summary report
 #[contracttype]
 #[derive(Clone)]
@@ -52,6 +64,7 @@ pub struct RemittanceSummary {
     pub category_breakdown: Vec<CategoryBreakdown>,
     pub period_start: u64,
     pub period_end: u64,
+    pub data_availability: DataAvailability,
 }
 
 /// Savings progress report
@@ -294,13 +307,6 @@ pub struct PolicyPage {
     pub count: u32,
 }
 
-#[contracttype]
-#[derive(Clone)]
-pub struct PolicyPage {
-    pub items: Vec<InsurancePolicy>,
-    pub next_cursor: u32,
-    pub count: u32,
-}
 
 #[contract]
 pub struct ReportingContract;
@@ -406,15 +412,45 @@ impl ReportingContract {
         period_start: u64,
         period_end: u64,
     ) -> RemittanceSummary {
-        let addresses: ContractAddresses = env
+        // Return safe default if addresses are not configured instead of panicking
+        let addresses: Option<ContractAddresses> = env
             .storage()
             .instance()
-            .get(&symbol_short!("ADDRS"))
-            .unwrap_or_else(|| panic!("Contract addresses not configured"));
+            .get(&symbol_short!("ADDRS"));
+            
+        if addresses.is_none() {
+            return RemittanceSummary {
+                total_received: total_amount,
+                total_allocated: total_amount,
+                category_breakdown: Vec::new(&env),
+                period_start,
+                period_end,
+                data_availability: DataAvailability::Missing,
+            };
+        }
+        
+        let addresses = addresses.unwrap();
 
         let split_client = RemittanceSplitClient::new(&env, &addresses.remittance_split);
-        let split_percentages = split_client.get_split();
-        let split_amounts = split_client.calculate_split(&total_amount);
+        
+        let mut availability = DataAvailability::Complete;
+        
+        // Use try_ versions of the client calls to gracefully degrade on failure
+        let split_percentages = match split_client.try_get_split() {
+            Ok(Ok(res)) => res,
+            _ => {
+                availability = DataAvailability::Partial;
+                Vec::new(&env)
+            }
+        };
+        
+        let split_amounts = match split_client.try_calculate_split(&total_amount) {
+            Ok(Ok(res)) => res,
+            _ => {
+                availability = DataAvailability::Partial;
+                Vec::new(&env)
+            }
+        };
 
         let mut breakdown = Vec::new(&env);
         let categories = [
@@ -438,6 +474,7 @@ impl ReportingContract {
             category_breakdown: breakdown,
             period_start,
             period_end,
+            data_availability: availability,
         }
     }
 
