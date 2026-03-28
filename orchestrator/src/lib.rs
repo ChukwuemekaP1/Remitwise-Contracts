@@ -477,6 +477,52 @@ impl Orchestrator {
         }
     }
 
+    /// Validate that all remittance flow contract addresses are distinct
+    /// and do not reference the orchestrator itself.
+    ///
+    /// This guard protects against misconfiguration and self-referential
+    /// contract calls that could create invalid execution flows.
+    fn validate_remittance_flow_addresses(
+        env: &Env,
+        family_wallet_addr: &Address,
+        remittance_split_addr: &Address,
+        savings_addr: &Address,
+        bills_addr: &Address,
+        insurance_addr: &Address,
+    ) -> Result<(), OrchestratorError> {
+        let self_addr = env.current_contract_address();
+
+        let addrs = [
+            family_wallet_addr,
+            remittance_split_addr,
+            savings_addr,
+            bills_addr,
+            insurance_addr,
+        ];
+
+        for addr in addrs {
+            if *addr == self_addr {
+                return Err(OrchestratorError::InvalidContractAddress);
+            }
+        }
+
+        if family_wallet_addr == remittance_split_addr
+            || family_wallet_addr == savings_addr
+            || family_wallet_addr == bills_addr
+            || family_wallet_addr == insurance_addr
+            || remittance_split_addr == savings_addr
+            || remittance_split_addr == bills_addr
+            || remittance_split_addr == insurance_addr
+            || savings_addr == bills_addr
+            || savings_addr == insurance_addr
+            || bills_addr == insurance_addr
+        {
+            return Err(OrchestratorError::InvalidContractAddress);
+        }
+
+        Ok(())
+    }
+
     // ============================================================================
     // Helper Functions - Remittance Split Allocation
     // ============================================================================
