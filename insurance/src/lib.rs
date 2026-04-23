@@ -1,7 +1,7 @@
 #![no_std]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use remitwise_common::CoverageType;
+use remitwise_common::{CoverageType, EventCategory, EventPriority, RemitwiseEvents};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Env, Map, String, Symbol, Vec,
 };
@@ -10,7 +10,7 @@ use soroban_sdk::{
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 17_280; // ~1 day
 const INSTANCE_BUMP_AMOUNT: u32 = 518_400; // ~30 days
 
-// Pagination constants (used by tests)
+// Pagination constants
 pub const DEFAULT_PAGE_LIMIT: u32 = 20;
 pub const MAX_PAGE_LIMIT: u32 = 50;
 
@@ -19,6 +19,77 @@ const KEY_PAUSE_ADMIN: Symbol = symbol_short!("PAUSE_ADM");
 const KEY_NEXT_ID: Symbol = symbol_short!("NEXT_ID");
 const KEY_POLICIES: Symbol = symbol_short!("POLICIES");
 const KEY_OWNER_INDEX: Symbol = symbol_short!("OWN_IDX");
+
+// ---------------------------------------------------------------------------
+// Event topic symbols — locked; changing these is a breaking change for indexers
+// ---------------------------------------------------------------------------
+
+/// Topic action for PolicyCreated: (Remitwise, Transaction=0, Medium=1, "created")
+pub const EVT_POLICY_CREATED: Symbol = symbol_short!("created");
+/// Topic action for PremiumPaid: (Remitwise, Transaction=0, Low=0, "paid")
+pub const EVT_PREMIUM_PAID: Symbol = symbol_short!("paid");
+/// Topic action for PolicyDeactivated: (Remitwise, State=1, Medium=1, "deactive")
+pub const EVT_POLICY_DEACTIVATED: Symbol = symbol_short!("deactive");
+/// Topic action for ExternalRefUpdated: (Remitwise, State=1, Low=0, "ext_ref")
+pub const EVT_EXT_REF_UPDATED: Symbol = symbol_short!("ext_ref");
+
+// ---------------------------------------------------------------------------
+// Event payload structs
+// ---------------------------------------------------------------------------
+
+/// Payload emitted when a new insurance policy is created.
+///
+/// Topics: `("Remitwise", Transaction=0, Medium=1, "created")`
+#[derive(Clone)]
+#[contracttype]
+pub struct PolicyCreatedEvent {
+    pub policy_id: u32,
+    pub owner: Address,
+    pub coverage_type: CoverageType,
+    pub monthly_premium: i128,
+    pub coverage_amount: i128,
+    pub timestamp: u64,
+}
+
+/// Payload emitted when a premium payment is recorded.
+///
+/// Topics: `("Remitwise", Transaction=0, Low=0, "paid")`
+#[derive(Clone)]
+#[contracttype]
+pub struct PremiumPaidEvent {
+    pub policy_id: u32,
+    pub owner: Address,
+    pub amount: i128,
+    pub next_payment_date: u64,
+    pub timestamp: u64,
+}
+
+/// Payload emitted when a policy is deactivated.
+///
+/// Topics: `("Remitwise", State=1, Medium=1, "deactive")`
+#[derive(Clone)]
+#[contracttype]
+pub struct PolicyDeactivatedEvent {
+    pub policy_id: u32,
+    pub owner: Address,
+    pub timestamp: u64,
+}
+
+/// Payload emitted when a policy's external reference is updated or cleared.
+///
+/// Topics: `("Remitwise", State=1, Low=0, "ext_ref")`
+#[derive(Clone)]
+#[contracttype]
+pub struct ExternalRefUpdatedEvent {
+    pub policy_id: u32,
+    pub owner: Address,
+    pub external_ref: Option<String>,
+    pub timestamp: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Core data types
+// ---------------------------------------------------------------------------
 
 #[contracttype]
 #[derive(Clone)]
@@ -41,6 +112,10 @@ pub struct PolicyPage {
     pub next_cursor: u32,
     pub count: u32,
 }
+
+// ---------------------------------------------------------------------------
+// Contract
+// ---------------------------------------------------------------------------
 
 #[contract]
 pub struct Insurance;
@@ -70,6 +145,10 @@ impl Insurance {
         true
     }
 
+    /// Create a new insurance policy.
+    ///
+    /// Emits a `PolicyCreatedEvent` with topics
+    /// `("Remitwise", Transaction=0, Medium=1, "created")`.
     pub fn create_policy(
         env: Env,
         owner: Address,
@@ -96,7 +175,7 @@ impl Insurance {
             owner: owner.clone(),
             name,
             external_ref,
-            coverage_type,
+            coverage_type: coverage_type.clone(),
             monthly_premium,
             coverage_amount,
             active: true,
@@ -112,10 +191,26 @@ impl Insurance {
             .unwrap_or_else(|| Map::new(&env));
         let mut ids = index.get(owner.clone()).unwrap_or_else(|| Vec::new(&env));
         ids.push_back(next_id);
-        index.set(owner, ids);
+        index.set(owner.clone(), ids);
         env.storage().instance().set(&KEY_OWNER_INDEX, &index);
 
         env.storage().instance().set(&KEY_NEXT_ID, &next_id);
+
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::Transaction,
+            EventPriority::Medium,
+            EVT_POLICY_CREATED,
+            PolicyCreatedEvent {
+                policy_id: next_id,
+                owner,
+                coverage_type,
+                monthly_premium,
+                coverage_amount,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
         next_id
     }
 
@@ -129,6 +224,10 @@ impl Insurance {
         policies.get(policy_id)
     }
 
+    /// Deactivate an existing policy.
+    ///
+    /// Emits a `PolicyDeactivatedEvent` with topics
+    /// `("Remitwise", State=1, Medium=1, "deactive")`.
     pub fn deactivate_policy(env: Env, caller: Address, policy_id: u32) -> bool {
         caller.require_auth();
         Self::extend_instance_ttl(&env);
@@ -148,9 +247,26 @@ impl Insurance {
         policy.active = false;
         policies.set(policy_id, policy);
         env.storage().instance().set(&KEY_POLICIES, &policies);
+
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::State,
+            EventPriority::Medium,
+            EVT_POLICY_DEACTIVATED,
+            PolicyDeactivatedEvent {
+                policy_id,
+                owner: caller,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
         true
     }
 
+    /// Record a premium payment for a policy.
+    ///
+    /// Emits a `PremiumPaidEvent` with topics
+    /// `("Remitwise", Transaction=0, Low=0, "paid")`.
     pub fn pay_premium(env: Env, caller: Address, policy_id: u32) -> bool {
         caller.require_auth();
         Self::extend_instance_ttl(&env);
@@ -167,9 +283,71 @@ impl Insurance {
         if policy.owner != caller || !policy.active {
             return false;
         }
+        let amount = policy.monthly_premium;
         policy.next_payment_date = env.ledger().timestamp() + (30 * 86_400);
+        let next_payment_date = policy.next_payment_date;
         policies.set(policy_id, policy);
         env.storage().instance().set(&KEY_POLICIES, &policies);
+
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::Transaction,
+            EventPriority::Low,
+            EVT_PREMIUM_PAID,
+            PremiumPaidEvent {
+                policy_id,
+                owner: caller,
+                amount,
+                next_payment_date,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        true
+    }
+
+    /// Update or clear the external reference for a policy.
+    ///
+    /// Emits an `ExternalRefUpdatedEvent` with topics
+    /// `("Remitwise", State=1, Low=0, "ext_ref")`.
+    pub fn set_external_ref(
+        env: Env,
+        caller: Address,
+        policy_id: u32,
+        external_ref: Option<String>,
+    ) -> bool {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let mut policies: Map<u32, InsurancePolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+        let mut policy = match policies.get(policy_id) {
+            Some(p) => p,
+            None => return false,
+        };
+        if policy.owner != caller {
+            return false;
+        }
+        policy.external_ref = external_ref.clone();
+        policies.set(policy_id, policy);
+        env.storage().instance().set(&KEY_POLICIES, &policies);
+
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::State,
+            EventPriority::Low,
+            EVT_EXT_REF_UPDATED,
+            ExternalRefUpdatedEvent {
+                policy_id,
+                owner: caller,
+                external_ref,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
         true
     }
 
@@ -185,11 +363,29 @@ impl Insurance {
 
         let mut count: u32 = 0;
         let next_date = env.ledger().timestamp() + (30 * 86_400);
+        let ts = env.ledger().timestamp();
+
         for id in policy_ids.iter() {
             if let Some(mut p) = policies.get(id) {
                 if p.owner == caller && p.active {
+                    let amount = p.monthly_premium;
                     p.next_payment_date = next_date;
                     policies.set(id, p);
+
+                    RemitwiseEvents::emit(
+                        &env,
+                        EventCategory::Transaction,
+                        EventPriority::Low,
+                        EVT_PREMIUM_PAID,
+                        PremiumPaidEvent {
+                            policy_id: id,
+                            owner: caller.clone(),
+                            amount,
+                            next_payment_date: next_date,
+                            timestamp: ts,
+                        },
+                    );
+
                     count += 1;
                 }
             }
@@ -260,11 +456,7 @@ impl Insurance {
             }
         }
 
-        // If we returned a full page, we may or may not have more items;
-        // keep the cursor as the last returned id (caller can continue).
-        // If we returned less than a full page, no more data -> cursor 0.
         let out_cursor = if items.len() < limit { 0 } else { next_cursor };
-
         let count = items.len();
         PolicyPage {
             items,
@@ -273,3 +465,6 @@ impl Insurance {
         }
     }
 }
+
+#[cfg(test)]
+mod test;

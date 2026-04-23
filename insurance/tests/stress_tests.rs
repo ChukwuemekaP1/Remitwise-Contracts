@@ -106,11 +106,10 @@ fn contract_policy_page_ordering_and_cursor_correctness() {
     let owner = Address::generate(&env);
 
     let name = String::from_str(&env, "ContractPolicy");
-    let coverage_type = String::from_str(&env, "health");
 
     let mut created_ids = std::vec::Vec::new();
     for _ in 0..6 {
-        let id = client.create_policy(&owner, &name, &coverage_type, &120i128, &12_000i128);
+        let id = client.create_policy(&owner, &name, &CoverageType::Health, &120i128, &12_000i128, &None);
         created_ids.push(id);
     }
 
