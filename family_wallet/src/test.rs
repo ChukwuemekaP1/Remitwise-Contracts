@@ -2609,3 +2609,126 @@ fn test_disabled_rollover_only_checks_single_tx_limits() {
     let result = client.try_withdraw(&member, &token_contract.address(), &recipient, &500_0000000);
     assert!(result.is_err());
 }
+
+// ============================================================================
+// Archive Integrity Guard Tests
+//
+// Verify that archive_old_transactions enforces meta.tx_id == map_key.
+// A corrupted EXEC_TXS entry (mismatched tx_id) must cause a panic,
+// preventing silent archive corruption.
+// ============================================================================
+
+/// Inject a corrupted ExecutedTxMeta where meta.tx_id != map key and assert
+/// that archive_old_transactions panics with the integrity guard message.
+#[test]
+#[should_panic(expected = "Inconsistent executed transaction metadata")]
+fn test_archive_rejects_corrupted_tx_meta() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let member1 = Address::generate(&env);
+    client.init(&owner, &vec![&env, member1.clone()]);
+
+    set_ledger_time(&env, 100, 50_000);
+
+    // Inject a corrupted entry: map key = 1, but meta.tx_id = 999
+    env.as_contract(&contract_id, || {
+        let mut exec_txs: Map<u64, ExecutedTxMeta> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("EXEC_TXS"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        exec_txs.set(
+            1,
+            ExecutedTxMeta {
+                tx_id: 999,
+                tx_type: TransactionType::LargeWithdrawal,
+                proposer: owner.clone(),
+                executed_at: 10_000,
+            },
+        );
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("EXEC_TXS"), &exec_txs);
+    });
+
+    // Must panic — the integrity guard detects meta.tx_id (999) != map key (1)
+    client.archive_old_transactions(&owner, &25_000);
+}
+
+/// Verify fail-closed semantics: a corrupted entry must not allow any
+/// mutations to the archive map, even for entries that precede the
+/// corrupted one in iteration order.
+#[test]
+fn test_archive_corruption_does_not_mutate_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let member1 = Address::generate(&env);
+    client.init(&owner, &vec![&env, member1.clone()]);
+
+    set_ledger_time(&env, 100, 50_000);
+
+    // Inject a corrupted entry alongside a valid one
+    env.as_contract(&contract_id, || {
+        let mut exec_txs: Map<u64, ExecutedTxMeta> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("EXEC_TXS"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        // Valid entry
+        exec_txs.set(
+            1,
+            ExecutedTxMeta {
+                tx_id: 1,
+                tx_type: TransactionType::RegularWithdrawal,
+                proposer: owner.clone(),
+                executed_at: 5_000,
+            },
+        );
+
+        // Corrupted entry: meta.tx_id (777) != map key (2)
+        exec_txs.set(
+            2,
+            ExecutedTxMeta {
+                tx_id: 777,
+                tx_type: TransactionType::LargeWithdrawal,
+                proposer: owner.clone(),
+                executed_at: 8_000,
+            },
+        );
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("EXEC_TXS"), &exec_txs);
+    });
+
+    // Attempt archive — expect panic from the integrity guard
+    let result = client.try_archive_old_transactions(&owner, &25_000);
+    assert!(result.is_err());
+
+    // Archive must remain empty — no partial writes
+    let archived = client.get_archived_transactions(&owner, &10);
+    assert_eq!(archived.len(), 0);
+
+    // EXEC_TXS must be unchanged — both entries still present
+    env.as_contract(&contract_id, || {
+        let exec_txs: Map<u64, ExecutedTxMeta> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("EXEC_TXS"))
+            .unwrap();
+        assert_eq!(exec_txs.len(), 2);
+        assert!(exec_txs.contains_key(1));
+        assert!(exec_txs.contains_key(2));
+    });
+}
