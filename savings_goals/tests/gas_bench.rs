@@ -1,4 +1,6 @@
-use savings_goals::{ContributionItem, SavingsGoalContract, SavingsGoalContractClient, MAX_PAGE_LIMIT};
+use savings_goals::{
+    ContributionItem, SavingsGoalContract, SavingsGoalContractClient, MAX_PAGE_LIMIT,
+};
 use soroban_sdk::testutils::{Address as AddressTrait, EnvTestConfig, Ledger, LedgerInfo};
 use soroban_sdk::{Address, Env, String, Vec};
 
