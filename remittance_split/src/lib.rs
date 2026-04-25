@@ -1665,8 +1665,10 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::InvalidDueDate);
         }
 
-        // Check schedule cap before creating new schedule
-        let owner_schedules: Vec<u32> = env
+        // Load the owner's schedule index once and reuse it for both the
+        // cap check and the index update below. Persistent storage reads
+        // are billed; loading twice is a measurable gas regression.
+        let mut owner_schedules: Vec<u32> = env
             .storage()
             .persistent()
             .get(&DataKey::OwnerSchedules(owner.clone()))
@@ -1718,15 +1720,11 @@ impl RemittanceSplit {
             INSTANCE_BUMP_AMOUNT,
         );
 
-        // 2. Update owner's schedule index
-        let mut owner_schedules: Vec<u32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OwnerSchedules(owner.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
+        // 2. Update owner's schedule index.
+        // `next_schedule_id` is allocated as `current_max_id + 1`, so the
+        // per-owner index is naturally sorted ascending after `push_back`.
+        // Read paths rely on this invariant.
         owner_schedules.push_back(next_schedule_id);
-        // Ensure deterministic ordering for consistent query results
-        sort_u32_vec_ascending(&mut owner_schedules);
         env.storage()
             .persistent()
             .set(&DataKey::OwnerSchedules(owner.clone()), &owner_schedules);
@@ -1888,15 +1886,16 @@ impl RemittanceSplit {
     }
 
     pub fn get_remittance_schedules(env: Env, owner: Address) -> Vec<RemittanceSchedule> {
-        let mut schedule_ids: Vec<u32> = env
+        let schedule_ids: Vec<u32> = env
             .storage()
             .persistent()
             .get(&DataKey::OwnerSchedules(owner.clone()))
             .unwrap_or_else(|| Vec::new(&env));
 
-        // Ensure deterministic ordering by sorting IDs ascending
-        // This guarantees consistent results regardless of storage order
-        sort_u32_vec_ascending(&mut schedule_ids);
+        // schedule_ids is already sorted ascending by the write paths
+        // (`create_remittance_schedule` push_back of monotonic IDs;
+        // `import_snapshot` sorts on entry). Re-sorting here would be
+        // O(n²) per read for no gain.
 
         let mut result = Vec::new(&env);
         for id in schedule_ids.iter() {
@@ -1939,15 +1938,15 @@ impl RemittanceSplit {
         from_index: u32,
         limit: u32,
     ) -> SchedulePage {
-        let mut schedule_ids: Vec<u32> = env
+        let schedule_ids: Vec<u32> = env
             .storage()
             .persistent()
             .get(&DataKey::OwnerSchedules(owner.clone()))
             .unwrap_or_else(|| Vec::new(&env));
 
-        // Ensure deterministic ordering by sorting IDs ascending
-        // This guarantees stable pagination even if storage order changes
-        sort_u32_vec_ascending(&mut schedule_ids);
+        // schedule_ids is already sorted ascending by the write paths -
+        // see the matching note in `get_remittance_schedules`. Pagination
+        // stability is preserved without a per-read sort.
 
         let len = schedule_ids.len();
         let cap = clamp_limit(limit);
