@@ -174,6 +174,101 @@ pub struct BillPayments;
 #[contractimpl]
 impl BillPayments {
     // -----------------------------------------------------------------------
+    // Owner-index helpers
+    // -----------------------------------------------------------------------
+
+    /// Return the active-bill ID list for `owner` (ID-ascending, no gaps).
+    fn get_owner_bills(env: &Env, owner: &Address) -> Vec<u32> {
+        let idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_OWNER_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Return the archived-bill ID list for `owner`.
+    fn get_owner_archived_bills(env: &Env, owner: &Address) -> Vec<u32> {
+        let idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_ARCH_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Append `bill_id` to the active index for `owner`.
+    /// IDs are appended in creation order, which is ID-ascending by construction.
+    fn index_add_active(env: &Env, owner: &Address, bill_id: u32) {
+        let mut idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_OWNER_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        let mut ids = idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env));
+        ids.push_back(bill_id);
+        idx.set(owner.clone(), ids);
+        env.storage()
+            .instance()
+            .set(&STORAGE_OWNER_INDEX, &idx);
+    }
+
+    /// Remove `bill_id` from the active index for `owner`.
+    fn index_remove_active(env: &Env, owner: &Address, bill_id: u32) {
+        let mut idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_OWNER_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        let ids = idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env));
+        let mut new_ids: Vec<u32> = Vec::new(env);
+        for id in ids.iter() {
+            if id != bill_id {
+                new_ids.push_back(id);
+            }
+        }
+        idx.set(owner.clone(), new_ids);
+        env.storage()
+            .instance()
+            .set(&STORAGE_OWNER_INDEX, &idx);
+    }
+
+    /// Append `bill_id` to the archived index for `owner`.
+    fn index_add_archived(env: &Env, owner: &Address, bill_id: u32) {
+        let mut idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_ARCH_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        let mut ids = idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env));
+        ids.push_back(bill_id);
+        idx.set(owner.clone(), ids);
+        env.storage()
+            .instance()
+            .set(&STORAGE_ARCH_INDEX, &idx);
+    }
+
+    /// Remove `bill_id` from the archived index for `owner`.
+    fn index_remove_archived(env: &Env, owner: &Address, bill_id: u32) {
+        let mut idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_ARCH_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        let ids = idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env));
+        let mut new_ids: Vec<u32> = Vec::new(env);
+        for id in ids.iter() {
+            if id != bill_id {
+                new_ids.push_back(id);
+            }
+        }
+        idx.set(owner.clone(), new_ids);
+        env.storage()
+            .instance()
+            .set(&STORAGE_ARCH_INDEX, &idx);
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
@@ -695,6 +790,13 @@ impl BillPayments {
         let validated_ext_ref = Self::validate_optional_external_ref(&env, &external_ref)?;
 
         Self::extend_instance_ttl(&env);
+
+        // Enforce per-owner bill cap before touching storage.
+        let owner_bill_count = Self::get_owner_bills(&env, &owner).len();
+        if owner_bill_count >= MAX_BILLS_PER_OWNER {
+            return Err(BillPaymentsError::OwnerBillCapExceeded);
+        }
+
         let mut bills: Map<u32, Bill> = env
             .storage()
             .instance()
@@ -741,6 +843,8 @@ impl BillPayments {
         env.storage()
             .instance()
             .set(&symbol_short!("NEXT_ID"), &next_id);
+        // Update owner index
+        Self::index_add_active(&env, &bill_owner, next_id);
         Self::adjust_unpaid_total(&env, &bill_owner, amount);
 
         // Emit event for audit trail
@@ -820,6 +924,8 @@ impl BillPayments {
             env.storage()
                 .instance()
                 .set(&symbol_short!("NEXT_ID"), &next_id);
+            // Update owner index for the newly created recurring bill
+            Self::index_add_active(&env, &caller, next_id);
         }
 
         let paid_amount = bill.amount;
@@ -856,6 +962,14 @@ impl BillPayments {
         bills.get(bill_id)
     }
 
+    /// Return the number of active (non-archived) bills owned by `owner`.
+    ///
+    /// This is an O(1) read from the owner index and does not scan the full
+    /// bill map.  The count is bounded by `MAX_BILLS_PER_OWNER`.
+    pub fn get_owner_bill_count(env: Env, owner: Address) -> u32 {
+        Self::get_owner_bills(&env, &owner).len()
+    }
+
     // -----------------------------------------------------------------------
     // PAGINATED LIST QUERIES
     // -----------------------------------------------------------------------
@@ -882,14 +996,19 @@ impl BillPayments {
             .instance()
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
-        let max_id = Self::get_next_bill_id(&env);
+
+        // Use the owner index for O(owner_bills) traversal instead of O(NEXT_ID).
+        let owner_ids = Self::get_owner_bills(&env, &owner);
 
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for id in (cursor.saturating_add(1))..=max_id {
+        for id in owner_ids.iter() {
+            if id <= cursor {
+                continue;
+            }
             let Some(bill) = bills.get(id) else {
                 continue;
             };
-            if bill.owner != owner || bill.paid {
+            if bill.paid {
                 continue;
             }
             staging.push_back((id, bill));
@@ -916,16 +1035,18 @@ impl BillPayments {
             .instance()
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
-        let max_id = Self::get_next_bill_id(&env);
+
+        // Use the owner index for O(owner_bills) traversal instead of O(NEXT_ID).
+        let owner_ids = Self::get_owner_bills(&env, &owner);
 
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for id in (cursor.saturating_add(1))..=max_id {
+        for id in owner_ids.iter() {
+            if id <= cursor {
+                continue;
+            }
             let Some(bill) = bills.get(id) else {
                 continue;
             };
-            if bill.owner != owner {
-                continue;
-            }
             staging.push_back((id, bill));
             if staging.len() > limit {
                 break;
@@ -1191,16 +1312,18 @@ impl BillPayments {
             .instance()
             .get(&symbol_short!("ARCH_BILL"))
             .unwrap_or_else(|| Map::new(&env));
-        let max_id = Self::get_next_bill_id(&env);
+
+        // Use the archived owner index for O(owner_archived) traversal.
+        let owner_ids = Self::get_owner_archived_bills(&env, &owner);
 
         let mut staging: Vec<(u32, ArchivedBill)> = Vec::new(&env);
-        for id in (cursor.saturating_add(1))..=max_id {
+        for id in owner_ids.iter() {
+            if id <= cursor {
+                continue;
+            }
             let Some(bill) = archived.get(id) else {
                 continue;
             };
-            if bill.owner != owner {
-                continue;
-            }
             staging.push_back((id, bill));
             if staging.len() > limit {
                 break;
@@ -1350,6 +1473,8 @@ impl BillPayments {
         if removed_unpaid_amount > 0 {
             Self::adjust_unpaid_total(&env, &caller, -removed_unpaid_amount);
         }
+        // Remove from owner index
+        Self::index_remove_active(&env, &caller, bill_id);
         RemitwiseEvents::emit(
             &env,
             EventCategory::State,
@@ -1431,6 +1556,15 @@ impl BillPayments {
         env.storage()
             .instance()
             .set(&symbol_short!("ARCH_BILL"), &archived);
+
+        // Update owner indexes: move archived IDs from active → archived index.
+        // We iterate the archived map to find owner per ID.
+        for id in to_remove.iter() {
+            if let Some(bill) = archived.get(id) {
+                Self::index_remove_active(&env, &bill.owner, id);
+                Self::index_add_archived(&env, &bill.owner, id);
+            }
+        }
 
         Self::extend_archive_ttl(&env);
         Self::update_storage_stats(&env);
@@ -1679,6 +1813,8 @@ impl BillPayments {
                     currency: bill.currency.clone(),
                 };
                 bills.set(next_id, next_bill);
+                // Update owner index for the newly spawned recurring bill
+                Self::index_add_active(&env, &caller, next_id);
             } else {
                 unpaid_delta = unpaid_delta.saturating_sub(amount);
             }
@@ -1799,14 +1935,18 @@ impl BillPayments {
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let max_id = Self::get_next_bill_id(&env);
+        // Use the owner index for O(owner_bills) traversal instead of O(NEXT_ID).
+        let owner_ids = Self::get_owner_bills(&env, &owner);
 
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for id in (cursor.saturating_add(1))..=max_id {
+        for id in owner_ids.iter() {
+            if id <= cursor {
+                continue;
+            }
             let Some(bill) = bills.get(id) else {
                 continue;
             };
-            if bill.owner != owner || bill.currency != normalized_currency {
+            if bill.currency != normalized_currency {
                 continue;
             }
             staging.push_back((id, bill));
@@ -1858,14 +1998,20 @@ impl BillPayments {
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
         let normalized_currency = Self::normalize_currency(&env, &currency);
-        let max_id = Self::get_next_bill_id(&env);
-        for id in (cursor.saturating_add(1))..=max_id {
+
+        // Use the owner index for O(owner_bills) traversal instead of O(NEXT_ID).
+        let owner_ids = Self::get_owner_bills(&env, &owner);
+
+        let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
+        for id in owner_ids.iter() {
+            if id <= cursor {
+                continue;
+            }
             let Some(bill) = bills.get(id) else {
                 continue;
             };
-            if bill.owner != owner || bill.paid || bill.currency != normalized_currency {
+            if bill.paid || bill.currency != normalized_currency {
                 continue;
             }
             staging.push_back((id, bill));
