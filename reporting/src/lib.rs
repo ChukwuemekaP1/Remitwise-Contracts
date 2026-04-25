@@ -5,7 +5,7 @@ use soroban_sdk::{
     Env, Map, Vec,
 };
 
-use remitwise_common::{Category, CoverageType};
+pub use remitwise_common::{Category, CoverageType};
 
 // Storage TTL constants
 const DAY_IN_LEDGERS: u32 = 17280;
@@ -18,6 +18,11 @@ pub const INSTANCE_LIFETIME_THRESHOLD: u32 = PERSISTENT_LIFETIME_THRESHOLD;
 
 pub const ARCHIVE_BUMP_AMOUNT: u32 = 150 * DAY_IN_LEDGERS; // ~150 days
 pub const ARCHIVE_LIFETIME_THRESHOLD: u32 = 1 * DAY_IN_LEDGERS; // 1 day
+
+/// Maximum number of pages fetched from any single dependency per report call.
+/// Loops that reach this cap mark the result `DataAvailability::Partial` so
+/// callers know the aggregate may be incomplete.
+pub const MAX_DEP_PAGES: u32 = 20;
 
 /// Financial health score (0-100)
 #[contracttype]
@@ -99,6 +104,7 @@ pub struct BillComplianceReport {
     pub compliance_percentage: u32,
     pub period_start: u64,
     pub period_end: u64,
+    pub data_availability: DataAvailability,
 }
 
 /// Insurance coverage report
@@ -112,6 +118,7 @@ pub struct InsuranceReport {
     pub coverage_to_premium_ratio: u32,
     pub period_start: u64,
     pub period_end: u64,
+    pub data_availability: DataAvailability,
 }
 
 /// Family spending report
@@ -849,8 +856,6 @@ impl ReportingContract {
             .unwrap_or_else(|| panic!("Contract addresses not configured"));
 
         let bill_client = BillPaymentsClient::new(env, &addresses.bill_payments);
-        let page = bill_client.get_all_bills_for_owner(&user, &0u32, &50u32);
-        let all_bills = page.items;
 
         let mut total_bills = 0u32;
         let mut paid_bills = 0u32;
@@ -859,28 +864,39 @@ impl ReportingContract {
         let mut total_amount = 0i128;
         let mut paid_amount = 0i128;
         let mut unpaid_amount = 0i128;
-
         let current_time = env.ledger().timestamp();
+        let mut data_availability = DataAvailability::Complete;
 
-        for bill in all_bills.iter() {
-            // Filter by period
-            if bill.created_at < period_start || bill.created_at > period_end {
-                continue;
-            }
-
-            total_bills += 1;
-            total_amount += bill.amount;
-
-            if bill.paid {
-                paid_bills += 1;
-                paid_amount += bill.amount;
-            } else {
-                unpaid_bills += 1;
-                unpaid_amount += bill.amount;
-                if bill.due_date < current_time {
-                    overdue_bills += 1;
+        let mut cursor = 0u32;
+        let mut pages_fetched = 0u32;
+        loop {
+            let page = bill_client.get_all_bills_for_owner(&user, &cursor, &50u32);
+            for bill in page.items.iter() {
+                if bill.created_at < period_start || bill.created_at > period_end {
+                    continue;
+                }
+                total_bills += 1;
+                total_amount += bill.amount;
+                if bill.paid {
+                    paid_bills += 1;
+                    paid_amount += bill.amount;
+                } else {
+                    unpaid_bills += 1;
+                    unpaid_amount += bill.amount;
+                    if bill.due_date < current_time {
+                        overdue_bills += 1;
+                    }
                 }
             }
+            pages_fetched += 1;
+            if page.next_cursor == 0 {
+                break;
+            }
+            if pages_fetched >= MAX_DEP_PAGES {
+                data_availability = DataAvailability::Partial;
+                break;
+            }
+            cursor = page.next_cursor;
         }
 
         let compliance_percentage = if total_bills > 0 {
@@ -900,6 +916,7 @@ impl ReportingContract {
             compliance_percentage,
             period_start,
             period_end,
+            data_availability,
         }
     }
 
@@ -935,15 +952,29 @@ impl ReportingContract {
             .unwrap_or_else(|| panic!("Contract addresses not configured"));
 
         let insurance_client = InsuranceClient::new(env, &addresses.insurance);
-        let policy_page = insurance_client.get_active_policies(&user, &0, &50);
-        let policies = policy_page.items;
         let monthly_premium = insurance_client.get_total_monthly_premium(&user);
 
         let mut total_coverage = 0i128;
-        let active_policies = policies.len();
+        let mut active_policies = 0u32;
+        let mut data_availability = DataAvailability::Complete;
 
-        for policy in policies.iter() {
-            total_coverage += policy.coverage_amount;
+        let mut cursor = 0u32;
+        let mut pages_fetched = 0u32;
+        loop {
+            let page = insurance_client.get_active_policies(&user, &cursor, &50);
+            for policy in page.items.iter() {
+                active_policies += 1;
+                total_coverage += policy.coverage_amount;
+            }
+            pages_fetched += 1;
+            if page.next_cursor == 0 {
+                break;
+            }
+            if pages_fetched >= MAX_DEP_PAGES {
+                data_availability = DataAvailability::Partial;
+                break;
+            }
+            cursor = page.next_cursor;
         }
 
         let annual_premium = monthly_premium * 12;
@@ -961,6 +992,7 @@ impl ReportingContract {
             coverage_to_premium_ratio,
             period_start,
             period_end,
+            data_availability,
         }
     }
 

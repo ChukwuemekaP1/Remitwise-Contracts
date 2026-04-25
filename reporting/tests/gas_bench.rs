@@ -182,6 +182,7 @@ macro_rules! mock_bills {
                             id: i,
                             owner: owner.clone(),
                             name: SorobanString::from_str(&env, "Bench Bill"),
+                            external_ref: None,
                             amount: 100i128,
                             due_date: 1_800_000_000,
                             recurring: false,
@@ -190,6 +191,7 @@ macro_rules! mock_bills {
                             created_at: super::BILL_CREATED_AT,
                             paid_at: None,
                             schedule_id: None,
+                            tags: Vec::new(&env),
                             currency: SorobanString::from_str(&env, "USDC"),
                             external_ref: None,
                             tags: Vec::new(&env),
@@ -220,6 +222,7 @@ macro_rules! mock_bills {
                             id: i,
                             owner: owner.clone(),
                             name: SorobanString::from_str(&env, "Bench Bill"),
+                            external_ref: None,
                             amount: 100i128,
                             due_date: 1_800_000_000,
                             recurring: false,
@@ -228,6 +231,7 @@ macro_rules! mock_bills {
                             created_at: super::BILL_CREATED_AT,
                             paid_at: if paid { Some(1_700_010_000) } else { None },
                             schedule_id: None,
+                            tags: Vec::new(&env),
                             currency: SorobanString::from_str(&env, "USDC"),
                             external_ref: None,
                             tags: Vec::new(&env),
@@ -249,7 +253,7 @@ macro_rules! mock_bills {
 macro_rules! mock_insurance {
     ($mod_name:ident, $struct_name:ident, $n:expr) => {
         mod $mod_name {
-            use reporting::{InsurancePolicy, InsuranceTrait, PolicyPage};
+            use reporting::{CoverageType, InsurancePolicy, InsuranceTrait, PolicyPage};
             use soroban_sdk::{contract, contractimpl, Address, Env, String as SorobanString, Vec};
 
             #[contract]
