@@ -9,12 +9,16 @@ use soroban_sdk::{
 // Event topics
 const GOAL_CREATED: Symbol = symbol_short!("created");
 const GOAL_COMPLETED: Symbol = symbol_short!("completed");
+const FUNDS_ADDED: Symbol = symbol_short!("added");
+const FUNDS_WITHDRAWN: Symbol = symbol_short!("withdrawn");
 
 #[derive(Clone)]
 #[contracttype]
 pub struct GoalCreatedEvent {
     pub goal_id: u32,
     pub owner: Address,
+    pub amount: i128,      // Initial amount (0)
+    pub new_total: i128,   // Initial total (0)
     pub name: String,
     pub target_amount: i128,
     pub target_date: u64,
@@ -46,8 +50,9 @@ pub struct FundsWithdrawnEvent {
 pub struct GoalCompletedEvent {
     pub goal_id: u32,
     pub owner: Address,
+    pub amount: i128,      // Final contribution amount
+    pub new_total: i128,   // Total amount reached
     pub name: String,
-    pub final_amount: i128,
     pub timestamp: u64,
 }
 
@@ -740,6 +745,8 @@ impl SavingsGoalContract {
         let event = GoalCreatedEvent {
             goal_id: new_id,
             owner: owner.clone(),
+            amount: 0,
+            new_total: 0,
             name: goal.name.clone(),
             target_amount,
             target_date,
@@ -755,7 +762,7 @@ impl SavingsGoalContract {
             EventCategory::State,
             EventPriority::Medium,
             GOAL_CREATED,
-            event,
+            event.clone(),
         );
         RemitwiseEvents::emit(
             &env,
@@ -866,7 +873,8 @@ impl SavingsGoalContract {
             (goal_id, caller.clone(), amount),
         );
 
-        if was_completed && !previously_completed {
+            // Legacy/Action-specific topics
+            env.events().publish((GOAL_COMPLETED,), completed_event);
             env.events().publish(
                 (GOAL_COMPLETED,),
                 GoalCompletedEvent {
@@ -1118,15 +1126,18 @@ impl SavingsGoalContract {
             new_total: new_amount,
             timestamp: env.ledger().timestamp(),
         };
+
+        // Standardized event emission for indexers
         RemitwiseEvents::emit(
             &env,
             EventCategory::Transaction,
             EventPriority::Medium,
-            symbol_short!("funds_rem"),
-            withdraw_event,
+            FUNDS_WITHDRAWN,
+            withdraw_event.clone(),
         );
 
-        Self::append_audit(&env, symbol_short!("withdraw"), &caller, true);
+        // Legacy/Action-specific topics
+        env.events().publish((FUNDS_WITHDRAWN,), withdraw_event);
         env.events().publish(
             (symbol_short!("savings"), SavingsEvent::FundsWithdrawn),
             (goal_id, caller, amount),
