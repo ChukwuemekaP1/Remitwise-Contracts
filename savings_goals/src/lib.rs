@@ -1653,7 +1653,7 @@ impl SavingsGoalContract {
     }
 
     /// Backward-compatible: returns ALL goals for owner in one Vec.
-    /// Prefer the paginated `get_goals` for production use.
+    /// Prefer the paginated `get_goals` / `get_goals_for_owner` for production use.
     pub fn get_all_goals(env: Env, owner: Address) -> Vec<SavingsGoal> {
         let ids: Vec<u32> = env
             .storage()
