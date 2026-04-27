@@ -215,7 +215,7 @@ pub struct AuditEntry {
 const SCHEMA_VERSION: u32 = 1;
 /// Oldest snapshot schema version this contract can import. Enables backward compat.
 const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
-const MAX_AUDIT_ENTRIES: u32 = 100;
+const MAX_AUDIT_ENTRIES: u32 = 5;
 const CONTRACT_VERSION: u32 = 1;
 const MAX_BATCH_SIZE: u32 = 50;
 
@@ -1075,24 +1075,6 @@ impl SavingsGoalContract {
                 INSTANCE_BUMP_AMOUNT,
             );
 
-            // Audit
-            Self::append_audit(&env, symbol_short!("add"), &caller, true);
-
-            // Detailed structured event
-            RemitwiseEvents::emit(
-                &env,
-                EventCategory::Transaction,
-                EventPriority::Medium,
-                FUNDS_ADDED,
-                FundsAddedEvent {
-                    goal_id: item.goal_id,
-                    owner: caller.clone(),
-                    amount: item.amount,
-                    new_total,
-                    timestamp: now,
-                },
-            );
-
             // Module-specific simple event
             env.events().publish(
                 (symbol_short!("savings"), SavingsEvent::FundsAdded),
@@ -1130,6 +1112,9 @@ impl SavingsGoalContract {
 
             count += 1;
         }
+
+        // Audit once per batch
+        Self::append_audit(&env, symbol_short!("batch_ad"), &caller, true);
 
         RemitwiseEvents::emit(
             &env,
@@ -1425,15 +1410,9 @@ impl SavingsGoalContract {
 
         let mut start_index: u32 = 0;
         if cursor != 0 {
-            let mut found = false;
-            for i in 0..ids.len() {
-                if ids.get(i) == Some(cursor) {
-                    start_index = i + 1;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
+            if let Some(pos) = ids.iter().position(|id| id == cursor) {
+                start_index = (pos as u32) + 1;
+            } else {
                 panic!("Invalid cursor");
             }
         }
@@ -1444,10 +1423,7 @@ impl SavingsGoalContract {
         }
 
         let mut result = Vec::new(&env);
-        for i in start_index..end_index {
-            let goal_id = ids
-                .get(i)
-                .unwrap_or_else(|| panic!("Pagination index out of sync"));
+        for goal_id in ids.iter().skip(start_index as usize).take(limit as usize) {
             let goal = env
                 .storage()
                 .persistent()
@@ -1621,15 +1597,9 @@ impl SavingsGoalContract {
 
         let mut start_index: u32 = 0;
         if cursor != 0 {
-            let mut found = false;
-            for i in 0..ids.len() {
-                if ids.get(i) == Some(cursor) {
-                    start_index = i + 1;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
+            if let Some(pos) = ids.iter().position(|id| id == cursor) {
+                start_index = (pos as u32) + 1;
+            } else {
                 panic!("Invalid cursor");
             }
         }
@@ -1640,10 +1610,7 @@ impl SavingsGoalContract {
         }
 
         let mut result = Vec::new(&env);
-        for i in start_index..end_index {
-            let goal_id = ids
-                .get(i)
-                .unwrap_or_else(|| panic!("Archived pagination index out of sync"));
+        for goal_id in ids.iter().skip(start_index as usize).take(limit as usize) {
             let goal = env
                 .storage()
                 .persistent()
@@ -1693,6 +1660,7 @@ impl SavingsGoalContract {
             .persistent()
             .get(&DataKey::OwnerGoals(owner.clone()))
             .unwrap_or_else(|| Vec::new(&env));
+
         let mut result = Vec::new(&env);
         for goal_id in ids.iter() {
             if let Some(goal) = env
@@ -1900,13 +1868,7 @@ impl SavingsGoalContract {
             .get(&DataKey::Audit)
             .unwrap_or_else(|| Vec::new(env));
         if log.len() >= MAX_AUDIT_ENTRIES {
-            let mut new_log = Vec::new(env);
-            for i in 1..log.len() {
-                if let Some(entry) = log.get(i) {
-                    new_log.push_back(entry);
-                }
-            }
-            log = new_log;
+            log.remove(0);
         }
         log.push_back(AuditEntry {
             operation,
